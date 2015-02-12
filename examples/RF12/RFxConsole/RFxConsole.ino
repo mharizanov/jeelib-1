@@ -1361,6 +1361,14 @@ void loop () {
             showString(PSTR("dB"));
         }
         printOneChar(')');
+        showString(PSTR(" T:"));
+        Serial.print(RF69::lowThreshold);
+        printOneChar(':');
+        Serial.print(RF69::currentThreshold);
+        printOneChar(':');
+        Serial.print(RF69::highThreshold);
+        printOneChar('@');
+        Serial.print(RF69::goodStep);
 #endif
 //TODO MartynJ       showString(PSTR(" Samples="));
 //TODO        Serial.print((RF69::rssiSamples));

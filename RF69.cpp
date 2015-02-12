@@ -27,6 +27,7 @@
 #define REG_DIOMAPPING1     0x25
 #define REG_IRQFLAGS1       0x27
 #define REG_IRQFLAGS2       0x28
+#define REG_RSSITHRESHOLD   0x29
 #define REG_SYNCCONFIG      0x2E
 #define REG_SYNCVALUE1      0x2F
 #define REG_SYNCVALUE2      0x30
@@ -78,7 +79,7 @@
 #define RssiStart           0x01
 #define RssiDone            0x02
 
-#define AfcClear            0x02
+#define AfcClear            0x0C
 
 #define oneByteSync         0x80
 #define twoByteSync         0x88
@@ -110,13 +111,20 @@ namespace RF69 {
     uint16_t underrun;
     uint8_t  present;
     uint16_t pcIntCount;
-    uint8_t  pcIntBits;
+    uint8_t pcIntBits;
+    uint8_t lowThreshold;
+    uint8_t currentThreshold;
+    uint8_t highThreshold;
+    uint8_t goodStep;
+    
     }
 
 static volatile uint8_t rxfill;      // number of data bytes in rf12_buf
 static volatile int8_t rxstate;      // current transceiver state
 static volatile uint8_t packetBytes; // Count of bytes in packet
 static volatile uint16_t discards;   // Count of packets discarded
+static volatile uint8_t waitPayload;
+static volatile uint8_t badStep;
 
 static ROM_UINT8 configRegs_compat [] ROM_DATA = {
   0x2E, 0xA0, // SyncConfig = sync on, sync size = 5
@@ -129,8 +137,8 @@ static ROM_UINT8 configRegs_compat [] ROM_DATA = {
  // 0x02, 0x00, // DataModul = packet mode, fsk
   0x03, 0x02, // BitRateMsb, data rate = 49,261 khz
   0x04, 0x8A, // BitRateLsb, divider = 32 MHz / 650 == 49,230 khz
-  0x05, 0x05, // FdevMsb = 90 KHz
-  0x06, 0xC3, // FdevLsb = 90 KHz
+  0x05, 0x02, // FdevMsb = 45 KHz
+  0x06, 0xE1, // FdevLsb = 45 KHz
   // 0x07, 0xD9, // FrfMsb, freq = 868.000 MHz
   // 0x08, 0x00, // FrfMib, divider = 14221312
   // 0x09, 0x00, // FrfLsb, step = 61.03515625
@@ -141,7 +149,7 @@ static ROM_UINT8 configRegs_compat [] ROM_DATA = {
 */
   0x19, 0x42, // RxBw ...
   0x1A, 0x91, // 0x8B,   // Channel filter BW
-  0x1E, 0x0E, // AfcAutoclearOn, AfcAutoOn
+  0x1E, 0x0C, // AfcAutoclearOn, AfcAutoOn
 //  0x25, 0x80, // DioMapping1 = RSSI threshold
   0x29, 0xA0, // RssiThresh ... -80dB
 
@@ -156,6 +164,7 @@ static ROM_UINT8 configRegs_compat [] ROM_DATA = {
   0x3C, 0x8F, // FifoTresh, not empty, level 15
   0x3D, 0x10, // PacketConfig2, interpkt = 1, autorxrestart off
   0x6F, 0x20, // 0x30, // TestDagc ...
+  0x71, 0x02, // RegTestAfc
   0
 };  
 /*
@@ -268,6 +277,12 @@ void RF69::configure_compat () {
             writeReg(REG_SYNCCONFIG, fiveByteSync);
         }   
 
+        goodStep = 0;
+        badStep = 3;// Initial value to reduce sensitivty (lift the RSSI Threshold)
+        highThreshold = 0;
+        lowThreshold = 255;    
+
+
         writeReg(REG_FRFMSB, frf >> 16);
         writeReg(REG_FRFMSB+1, frf >> 8);
         writeReg(REG_FRFMSB+2, frf);
@@ -378,6 +393,8 @@ void RF69::interrupt_compat () {
             // The window for grabbing the above values is quite small
             // values available during transfer between the ether
             // and the inbound fifo buffer.
+
+            waitPayload = true;
             rxP++;
             crc = ~0;
             packetBytes = 0;
@@ -395,16 +412,45 @@ void RF69::interrupt_compat () {
                         recvBuf[rxfill++] = in;
                         packetBytes++;
                         crc = _crc16_update(crc, in);              
-                        if (rxfill >= rf12_len + 5 || rxfill >= RF_MAX)
-                           break;
+                        if (rxfill >= rf12_len + 5 || rxfill >= RF_MAX) {
+                            waitPayload = false; //  Successful reception
+                            break;
+                        }
                     }
                 } else {             
                     fifooverrun++;                  
                 }
             }
+            
             if (packetBytes < 5) underrun++;
             byteCount = rxfill;
             writeReg(REG_AFCFEI, AfcClear); 
+            
+            // This section reduces the radio sensitivity
+            // if afc is way off and payload didn't happen
+            // after the previous IRQ1_RXREADY 
+            currentThreshold = readReg(REG_RSSITHRESHOLD);
+            if ((afc & 0x7F80) && (waitPayload)) {
+                currentThreshold-= badStep;
+                if (currentThreshold < 80) currentThreshold = 80;
+                writeReg(REG_RSSITHRESHOLD, currentThreshold);
+                goodStep = 8;   // Count for next uplift   
+            } else {            // in sensitivity 
+            
+                goodStep--;          // Countdown to an increase in sensitivity
+                if (!goodStep) {
+                   badStep = 1;      // Coarse tuning completed
+                    if (currentThreshold > highThreshold) 
+                     highThreshold = currentThreshold; // Store bounds of
+                    if (currentThreshold < lowThreshold)
+                     lowThreshold = currentThreshold;  // relative stability 
+                    if (!(currentThreshold++)) currentThreshold = 255;
+                    goodStep = 255;  // Wait a long time before another increase 
+                    writeReg(REG_RSSITHRESHOLD, currentThreshold);
+                }   
+            }
+
+
             
         } else if (readReg(REG_IRQFLAGS2) & IRQ2_PACKETSENT) {
             writeReg(REG_TESTPA1, TESTPA1_NORMAL);    // Turn off high power 
